@@ -1,4 +1,5 @@
 ccxt
+google-genai
 groq
 numpy
 openai
