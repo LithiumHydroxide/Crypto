@@ -3,6 +3,9 @@ import pandas as pd
 import numpy as np
 from datetime import datetime
 import os
+import json
+import requests
+from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 import ccxt
 import plotly.graph_objects as go
@@ -15,11 +18,12 @@ from openai import OpenAI
 # Load environment variables
 load_dotenv(".env.trade", override=True)
 
-# FIXED: Corrected Gemini model name to a valid, active model
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+# FIXED: Corrected to valid, currently active AI model names
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 AIRFORCE_MODEL = os.getenv("AIRFORCE_MODEL", "claude-3-haiku")
 
+# Page config
 st.set_page_config(page_title="Crypto Monitor & AI Advisor", layout="wide", initial_sidebar_state="expanded")
 st.title("🚀 Crypto Scanner & AI Advisor (Long / Short)")
 
@@ -83,14 +87,11 @@ def calculate_adx(df, period=14):
     tr2 = (high - close.shift()).abs()
     tr3 = (low - close.shift()).abs()
     tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    
     plus_dm = high.diff().clip(lower=0)
-    minus_dm = low.diff().abs().clip(lower=0) # Corrected for minus DM
-    
+    minus_dm = low.diff().abs().clip(lower=0)
     tr_smooth = tr.ewm(alpha=1/period, adjust=False).mean()
     plus_di = 100 * (plus_dm.ewm(alpha=1/period, adjust=False).mean() / tr_smooth)
     minus_di = 100 * (minus_dm.ewm(alpha=1/period, adjust=False).mean() / tr_smooth)
-    
     dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di)
     adx = dx.ewm(alpha=1/period, adjust=False).mean()
     return adx
@@ -162,12 +163,12 @@ def fetch_coin_data(symbol, timeframe='1h', limit=100):
     except Exception:
         return None
 
-# --- BTC REGIME FILTER (Crucial for Win Rate) ---
+# --- BTC REGIME FILTER ---
 @st.cache_data(ttl=300, show_spinner=False)
 def get_btc_regime():
     """Checks BTC 4h trend to filter out bad altcoin longs"""
     df = fetch_coin_data('BTC', '4h', limit=100)
-    if df is None: return "NEUTRAL", 0
+    if df is None: return "NEUTRAL ⚪", 0
     price = df['close'].iloc[-1]
     ema20 = df['ema_20'].iloc[-1]
     ema50 = df['ema_50'].iloc[-1]
@@ -200,7 +201,6 @@ def analyze_coin(symbol, timeframes_list, price_boost, volume_boost, rsi_thresh,
         change_24h = ((current_price - df['close'].iloc[0]) / df['close'].iloc[0] * 100) if len(df) > 1 else 0
 
         # HIGH WIN-RATE SIGNAL LOGIC
-        # LONG: Needs Trend (EMA), Momentum (RSI/Price), Strength (ADX > 20), Institutional Support (Price > VWAP), and BTC Approval
         is_long = (
             change_24h >= price_boost and 
             volume_change_pct >= volume_boost and 
@@ -208,10 +208,9 @@ def analyze_coin(symbol, timeframes_list, price_boost, volume_boost, rsi_thresh,
             (current_price > ema_20 and ema_20 > ema_50) and
             (adx > 20) and 
             (current_price > vwap) and
-            (btc_regime != "BEARISH 🔴") # Block altcoin longs if BTC is dumping
+            (btc_regime != "BEARISH 🔴")
         )
         
-        # SHORT: Inverse logic
         is_short = (
             change_24h <= -price_boost and 
             volume_change_pct >= volume_boost and 
@@ -219,7 +218,7 @@ def analyze_coin(symbol, timeframes_list, price_boost, volume_boost, rsi_thresh,
             (current_price < ema_20 and ema_20 < ema_50) and
             (adx > 20) and 
             (current_price < vwap) and
-            (btc_regime != "BULLISH 🟢") # Block altcoin shorts if BTC is pumping
+            (btc_regime != "BULLISH 🟢")
         )
         
         signal = "LONG 🟢" if is_long else ("SHORT 🔴" if is_short else "NEUTRAL ⚪")
@@ -279,7 +278,7 @@ def get_coins_scan(coins_list, timeframes_list, price_boost, volume_boost, rsi_t
     progress_bar.empty()
     return sorted(coins_data, key=lambda x: abs(x['change_24h']), reverse=True)
 
-# --- AI GENERATION (FIXED GEMINI & ENHANCED PROMPT) ---
+# --- AI GENERATION ---
 def generate_ai_advice_with_fallback(symbol, timeframe, metrics, btc_regime, primary_provider="Gemini"):
     def generate_gemini_advice():
         api_key = os.getenv("GEMINI_API_KEY")
@@ -304,13 +303,7 @@ Provide: 1. Trade Recommendation (LONG/SHORT/WAIT). 2. Technical Explanation (Fo
         try:
             client = GroqClient(api_key=api_key)
             prompt = f"Analyze {symbol}/USDT ({timeframe}). Price: ${metrics['price']:.4f}, RSI: {metrics['rsi']:.1f}, ADX: {metrics['adx']:.1f}, VWAP: ${metrics['vwap']:.4f}, BTC Regime: {btc_regime}. Give LONG/SHORT/WAIT advice, 3 bullet points, and 1:2 RR targets."
-            
-            # ADD max_tokens=800 to stay under the 1000 OTPM limit
-            response = client.chat.completions.create(
-                messages=[{"role": "user", "content": prompt}], 
-                model=GROQ_MODEL,
-                max_tokens=800
-            )
+            response = client.chat.completions.create(messages=[{"role": "user", "content": prompt}], model=GROQ_MODEL, max_tokens=800)
             return response.choices[0].message.content
         except Exception as e: return f"Error (Groq): {str(e)}"
 
@@ -346,7 +339,7 @@ def plot_interactive_chart(df, symbol, timeframe):
     
     fig.add_trace(go.Scatter(x=df['timestamp'], y=df['rsi'], line=dict(color='purple', width=1.5), name="RSI"), row=3, col=1)
     fig.add_trace(go.Scatter(x=df['timestamp'], y=df['adx'], line=dict(color='gold', width=1.5), name="ADX"), row=3, col=1)
-    fig.add_hline(y=20, line_dash="dot", line_color="red", row=3, col=1) # ADX Trend Threshold
+    fig.add_hline(y=20, line_dash="dot", line_color="red", row=3, col=1)
     
     colors = ['#00E676' if val >= 0 else '#FF5252' for val in df['macd_hist']]
     fig.add_trace(go.Bar(x=df['timestamp'], y=df['macd_hist'], marker_color=colors, name="MACD Hist"), row=4, col=1)
@@ -388,7 +381,7 @@ try:
     col4.metric("📊 Total Scanned", len(coins_analysis))
     st.divider()
 
-    tab1, tab2 = st.tabs(["📊 Scan Table", "🤖 Deep Analysis & AI Advice"])
+    tab1, tab2, tab3 = st.tabs(["📊 Scan Table", "🤖 Deep Analysis & AI Advice", "📡 Live Social Feed"])
     
     with tab1:
         table_rows = [{'Symbol': c['symbol'], 'Price': f"{c['price']:.4f}" if c['price'] < 1 else f"{c['price']:.2f}", 
@@ -416,6 +409,85 @@ try:
                     with st.spinner(f"Analyzing market structure with {provider_name}..."):
                         ai_response = generate_ai_advice_with_fallback(selected_coin, selected_tf, metrics, btc_regime, primary_provider=provider_name)
                         st.markdown(ai_response)
+
+    # ============================================================
+    # TAB 3: LIVE SOCIAL FEED (Direct Web Scraper - NO API KEY NEEDED)
+    # ============================================================
+    with tab3:
+        st.subheader("📡 Live Telegram Alpha & Twitter Bridge Feed")
+        st.caption("Scraping public Telegram channel previews. No API key required.")
+
+        tg_channels = [
+            'whale_alert_io', 
+            'Binance_Announcements', 
+            'deItaone',       # Walter Bloomberg (Twitter Bridge)
+            'Tree_of_Alpha',  # Fastest crypto news (Twitter Bridge)
+            'WuBlockchain'    # Wu Blockchain (Twitter Bridge)
+        ]
+        
+        tg_keywords = ['BTC', 'ETH', 'SOL', 'XRP', 'DOGE', 'Listing', 'Pump', 'Binance', 'Fed', 'Rate']
+
+        col_fetch, col_info = st.columns([1, 3])
+        with col_fetch:
+            fetch_tg = st.button("🔄 Fetch Latest Telegram Alerts", type="primary", use_container_width=True)
+        
+        with col_info:
+            st.info(f"Monitoring **{len(tg_channels)}** channels for keywords: `{', '.join(tg_keywords[:5])}...`")
+
+        if fetch_tg:
+            alerts = []
+            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+            
+            progress = st.progress(0)
+            for idx, channel in enumerate(tg_channels):
+                try:
+                    url = f"https://t.me/s/{channel}"
+                    response = requests.get(url, headers=headers, timeout=10)
+                    
+                    if response.status_code == 200:
+                        soup = BeautifulSoup(response.text, 'html.parser')
+                        messages = soup.find_all('div', class_='tgme_widget_message_wrapper')
                         
+                        for msg in messages:
+                            text_el = msg.find('div', class_='tgme_widget_message_text')
+                            time_el = msg.find('time')
+                            
+                            if text_el and time_el:
+                                text = text_el.get_text(strip=True)
+                                if any(kw.lower() in text.lower() for kw in tg_keywords):
+                                    post_time = time_el.get('datetime', 'Unknown Time')
+                                    msg_link = msg.find('a', class_='tgme_widget_message_date')
+                                    link_url = msg_link['href'] if msg_link and msg_link.has_attr('href') else "#"
+                                    
+                                    alerts.append({
+                                        'channel': channel,
+                                        'time': post_time,
+                                        'message': text[:400] + "..." if len(text) > 400 else text,
+                                        'link': link_url
+                                    })
+                except Exception as e:
+                    st.warning(f"Could not scrape @{channel}: {str(e)[:50]}")
+                
+                progress.progress((idx + 1) / len(tg_channels))
+            
+            progress.empty()
+
+            if not alerts:
+                st.warning("No recent alerts matching your keywords were found in the last ~20 messages of these channels.")
+            else:
+                st.success(f"✅ Found **{len(alerts)}** matching alerts across {len(tg_channels)} channels.")
+                st.divider()
+                
+                alerts.sort(key=lambda x: x['time'], reverse=True)
+                
+                for alert in alerts:
+                    with st.container(border=True):
+                        col1, col2 = st.columns([4, 1])
+                        with col1:
+                            st.markdown(f"**📢 @{alert['channel']}** &nbsp; 🕒 `{alert['time']}`")
+                            st.write(alert['message'])
+                        with col2:
+                            st.markdown(f"[🔗 Open in Telegram]({alert['link']})")
+
 except Exception as e:
     st.error(f"Execution Error: {str(e)}")
